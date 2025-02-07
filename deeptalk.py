@@ -45,15 +45,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_context": 32768,
     "debug": False,
     "prepend_think": True,
-    "use_api_key": False,   # New: whether to use an API key
-    "api_key": ""           # New: the API key value (if any)
+    "use_api_key": False,   # whether to use an API key
+    "api_key": ""           # the API key value (if any)
 }
 
 def load_config() -> Dict[str, Any]:
-    """
-    Loads the configuration from CONFIG_FILE.
-    If the file does not exist or is invalid, returns the default configuration.
-    """
     if not os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'w') as f:
             json.dump(DEFAULT_CONFIG, f, indent=4)
@@ -64,7 +60,6 @@ def load_config() -> Dict[str, Any]:
                 config = json.load(f)
         except json.JSONDecodeError:
             config = DEFAULT_CONFIG.copy()
-        # Ensure all keys exist in the configuration.
         for key, value in DEFAULT_CONFIG.items():
             if key not in config:
                 config[key] = value
@@ -92,8 +87,8 @@ default_state: Dict[str, Any] = {
     "confirm_clear": False,
     "debug": config["debug"],
     "prepend_think": config["prepend_think"],
-    "use_api_key": config["use_api_key"],  # New session state value
-    "api_key": config["api_key"],          # New session state value
+    "use_api_key": config["use_api_key"],
+    "api_key": config["api_key"],
     "input_counter": 0,
     "save_log_mode": False,
     "backup_chat_history": None,
@@ -102,7 +97,6 @@ for key, value in default_state.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
-# Configure logging: Add a newline at the end of each message for readability.
 if st.session_state.debug:
     logging.basicConfig(level=logging.DEBUG, format="%(message)s\n")
 else:
@@ -114,20 +108,15 @@ def print_payload_history() -> None:
         payload = [{"role": msg["role"], "content": msg["content"]} for msg in st.session_state.chat_history]
         logging.debug("Payload History: %s", payload)
 
+# UPDATED: Removed the stripping of <think> tags.
 def clean_content(content: str) -> str:
     """
-    Cleans content by removing <think> tags only if the entire content is that block.
-    This prevents accidental removal of user-supplied <think> tags in the middle of the text.
+    Previously, this function stripped out content enclosed in <think> tags.
+    Now, we leave the content unchanged so that the CoT output remains available.
     """
-    if content.startswith("<think>") and content.endswith("</think>"):
-        return re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
     return content
 
 def parse_chunk(chunk: bytes) -> str:
-    """
-    Parses a chunk of the API response and extracts the content.
-    Returns an empty string on failure.
-    """
     try:
         text = chunk.decode("utf-8").strip()
     except Exception as e:
@@ -151,10 +140,12 @@ def parse_chunk(chunk: bytes) -> str:
 def process_stream_response(response: requests.Response, cot_placeholder: Any, ai_placeholder: Any) -> Tuple[str, str, bool]:
     """
     Processes the streaming API response and updates the UI.
-    Uses a buffer to accumulate CoT content if it spans multiple chunks.
-    Returns a tuple: (ai_reply, cot_content, stopped).
+    Accumulates CoT content as it arrives. If the closing tag never arrives,
+    the accumulated CoT (in cot_buffer) is committed once the stream finishes.
     """
-    ai_reply, cot_content, capturing_cot, stopped = "", "", False, False
+    ai_reply, cot_content = "", ""
+    capturing_cot = False
+    stopped = False
     cot_buffer = ""  # Buffer for accumulating CoT content
     for chunk in response.iter_lines():
         if st.session_state.stop_generation:
@@ -166,7 +157,8 @@ def process_stream_response(response: requests.Response, cot_placeholder: Any, a
             continue
         if "<think>" in delta:
             capturing_cot = True
-            cot_buffer = delta.replace("<think>", "")
+            # Start collecting CoT content.
+            cot_buffer += delta.replace("<think>", "")
             delta = ""
         if capturing_cot:
             if "</think>" in delta:
@@ -177,7 +169,7 @@ def process_stream_response(response: requests.Response, cot_placeholder: Any, a
                 capturing_cot = False
                 with cot_placeholder.expander("🔍 CoT Reasoning (Completed)", expanded=False):
                     st.markdown(cot_content)
-                # Update delta to the remainder so that stray closing tags are not appended.
+                # Continue with the remainder (if any).
                 delta = remainder
             else:
                 cot_buffer += delta
@@ -186,22 +178,14 @@ def process_stream_response(response: requests.Response, cot_placeholder: Any, a
                 continue
         ai_reply += delta
         ai_placeholder.markdown(ai_reply)
+    # FIX: If the stream ends but we are still capturing CoT, commit the buffer.
+    if capturing_cot and cot_buffer:
+        cot_content = cot_buffer
+        with cot_placeholder.expander("🔍 CoT Reasoning (Completed)", expanded=False):
+            st.markdown(cot_content)
     return ai_reply, cot_content, stopped
 
 def generate_log_text() -> str:
-    """
-    Generates a human-friendly log from the chat history.
-    For each conversation pair (user prompt and assistant response), includes:
-      User:
-      <prompt>
-      
-      CoT:
-      <chain-of-thought> (or "None" if empty)
-      
-      Answer:
-      <assistant answer> (or "None" if empty)
-    The log begins with a timestamp.
-    """
     header = "Log Exported on " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n\n"
     log_lines: List[str] = []
     history = st.session_state.chat_history
@@ -214,13 +198,6 @@ def generate_log_text() -> str:
     return header + "\n".join(log_lines)
 
 def build_payload() -> Dict[str, Any]:
-    """
-    Builds the payload for the API request.
-    It copies the chat history but removes the "cot" field from any assistant messages,
-    ensuring that only non-CoT (final answer) content is carried forward.
-    Also truncates older messages if the total context length exceeds max_context.
-    The payload always specifies the model 'deepseek-reasoner' internally.
-    """
     payload_messages: List[Dict[str, Any]] = []
     for msg in st.session_state.chat_history:
         msg_copy = msg.copy()
@@ -233,11 +210,11 @@ def build_payload() -> Dict[str, Any]:
     
     total_length = sum(len(json.dumps(msg)) for msg in payload_messages)
     while total_length > st.session_state.max_context and len(payload_messages) > 1:
-        payload_messages.pop(0)  # Remove the oldest message
+        payload_messages.pop(0)
         total_length = sum(len(json.dumps(msg)) for msg in payload_messages)
     
     return {
-        "model": "deepseek-reasoner",  # Model is now hard-coded internally.
+        "model": "deepseek-reasoner",  # Hard-coded internal model.
         "messages": payload_messages,
         "temperature": st.session_state.temperature,
         "top_p": st.session_state.top_p,
@@ -245,9 +222,6 @@ def build_payload() -> Dict[str, Any]:
     }
 
 def clear_confirmation_flow() -> None:
-    """
-    Displays confirmation buttons for clearing the chat history.
-    """
     clear_cols = st.columns(2)
     if st.button("✅ Clear", key="clear_confirm"):
         st.session_state.chat_history = []
@@ -261,9 +235,6 @@ def clear_confirmation_flow() -> None:
         st.rerun()
 
 def export_confirmation_flow() -> None:
-    """
-    Displays the filename input and Save/Cancel buttons for exporting the log.
-    """
     filename = st.text_input("Enter filename to export log:", key="log_filename")
     export_cols = st.columns(2)
     if export_cols[0].button("💾 Save", key="export_save_button"):
@@ -285,13 +256,13 @@ def export_confirmation_flow() -> None:
 # -------------------- Sidebar --------------------
 with st.sidebar:
     st.subheader("🔧 Configuration")
-    # --- API Endpoint and API Key (no separator here) ---
+    # API Endpoint and API Key (no separator here)
     st.session_state.api_endpoint = st.text_input("API Endpoint", st.session_state.api_endpoint)
     st.session_state.use_api_key = st.checkbox("Use API Key", value=st.session_state.use_api_key)
     if st.session_state.use_api_key:
         st.session_state.api_key = st.text_input("API Key", value=st.session_state.api_key, type="password")
     
-    # --- Other Configuration ---
+    # Other Configuration
     st.session_state.temperature = st.slider("Temperature", 0.0, 1.0, st.session_state.temperature, 0.01)
     st.session_state.top_p = st.slider("Top-p", 0.0, 1.0, st.session_state.top_p, 0.01)
     st.session_state.max_context = st.number_input("Max Context", min_value=1024, max_value=32768,
@@ -299,7 +270,7 @@ with st.sidebar:
     st.session_state.debug = st.checkbox("Debug", value=st.session_state.debug)
     st.session_state.prepend_think = st.checkbox("Prepend <think> tag", value=st.session_state.prepend_think)
     
-    # --- Configuration Buttons ---
+    # Configuration Buttons
     cols = st.columns(3)
     if cols[0].button("Save", key="config_save"):
         new_config = {
@@ -309,8 +280,8 @@ with st.sidebar:
             "max_context": st.session_state.max_context,
             "debug": st.session_state.debug,
             "prepend_think": st.session_state.prepend_think,
-            "use_api_key": st.session_state.use_api_key,  # Save the state of API key usage.
-            "api_key": st.session_state.api_key           # Save the API key (if provided).
+            "use_api_key": st.session_state.use_api_key,
+            "api_key": st.session_state.api_key
         }
         with open(CONFIG_FILE, "w") as f:
             json.dump(new_config, f, indent=4)
@@ -342,7 +313,7 @@ with st.sidebar:
     
     st.markdown("---")  # Separator for the following groups.
     
-    # --- Group 1: Stop and Clear (on one line) ---
+    # Group 1: Stop and Clear
     group1 = st.columns(2)
     if group1[0].button("🛑 Stop", key="stop_button"):
         st.session_state.stop_generation = True
@@ -352,7 +323,7 @@ with st.sidebar:
     if st.session_state.confirm_clear:
         clear_confirmation_flow()
     
-    # --- Group 2: Export (displayed on its own line) ---
+    # Group 2: Export
     if st.button("📄 Export", key="export_button", disabled=st.session_state.pending_generation):
         st.session_state.save_log_mode = True
     if st.session_state.save_log_mode:
@@ -385,13 +356,11 @@ with st.container() as static_container:
 if st.session_state.pending_generation and not st.session_state.confirm_clear:
     with st.container() as pending_container:
         headers: Dict[str, str] = {"Content-Type": "application/json"}
-        # If using an API key, add it to the headers (e.g. as a Bearer token).
         if st.session_state.use_api_key and st.session_state.api_key:
             headers["Authorization"] = f"Bearer {st.session_state.api_key}"
         payload = build_payload()
         if st.session_state.debug:
             logging.debug("Payload being submitted: %s", payload)
-        # Validate API endpoint URL.
         if not st.session_state.api_endpoint.startswith(("http://", "https://")):
             st.error("Invalid API endpoint URL. Please include 'http://' or 'https://'.")
             st.session_state.pending_generation = False
@@ -407,10 +376,8 @@ if st.session_state.pending_generation and not st.session_state.confirm_clear:
                         ai_placeholder = st.empty()
                         ai_reply, cot_content, stopped = process_stream_response(response, cot_placeholder, ai_placeholder)
             if stopped:
-                # On stop, remove an orphaned user prompt if it exists.
                 if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user":
                     st.session_state.chat_history.pop()
-                # Restore backup assistant message if available.
                 if st.session_state.backup_chat_history is not None:
                     st.session_state.chat_history.extend(st.session_state.backup_chat_history)
                     st.session_state.backup_chat_history = None
@@ -428,7 +395,6 @@ if st.session_state.pending_generation and not st.session_state.confirm_clear:
                     })
                     st.session_state.pending_prompt = ""
                     st.session_state.input_counter += 1
-                # Clear backup once a complete new message is generated.
                 st.session_state.backup_chat_history = None
                 st.session_state.pending_generation = False
                 st.rerun()
@@ -443,7 +409,6 @@ if (not st.session_state.pending_generation and st.session_state.chat_history an
     with st.container() as action_container:
         spacer, col_regen, col_remove = st.columns([4, 1, 1])
         if col_regen.button("🔄 Regen", key="regen_last", help="Regen"):
-            # Remove only the last assistant message while preserving the corresponding user prompt.
             if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "assistant":
                 st.session_state.backup_chat_history = [st.session_state.chat_history[-1]]
                 st.session_state.chat_history.pop()
@@ -451,7 +416,6 @@ if (not st.session_state.pending_generation and st.session_state.chat_history an
             print_payload_history()
             st.rerun()
         if col_remove.button("🗑 Remove", key="delete_last", help="Remove"):
-            # Remove the last complete conversation pair if possible.
             if len(st.session_state.chat_history) >= 2:
                 if (st.session_state.chat_history[-2]["role"] == "user" and
                     st.session_state.chat_history[-1]["role"] == "assistant"):
