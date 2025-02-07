@@ -39,7 +39,7 @@ st.set_page_config(page_title="DeepTalk DeepSeek-R1 GUI", page_icon="🤖", layo
 # -------------------- Configuration File Handling --------------------
 CONFIG_FILE: str = 'config.json'
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "api_endpoint": "http://localhost:5000/v1/chat/completions",
+    "api_endpoint": "http://linux-ai.local:5000/v1/chat/completions",
     "temperature": 0.6,
     "top_p": 0.95,
     "max_context": 32768,
@@ -71,7 +71,7 @@ config: Dict[str, Any] = load_config()
 st.title("🧠 DeepTalk DeepSeek-R1 GUI")
 st.write(
     "Proof-of-Concept for proper handling of CoT (<think></think> tagged) context.\n\n"
-    "CoT context is only used for generation and older CoT context is not resubmitted with new prompts."
+    "CoT context is used for generation but is not passed back on subsequent prompts."
 )
 
 # -------------------- Session State Initialization --------------------
@@ -108,13 +108,10 @@ def print_payload_history() -> None:
         payload = [{"role": msg["role"], "content": msg["content"]} for msg in st.session_state.chat_history]
         logging.debug("Payload History: %s", payload)
 
-# UPDATED: Removed the stripping of <think> tags.
+# Revert clean_content to the working version that removes <think>...</think> blocks.
 def clean_content(content: str) -> str:
-    """
-    Previously, this function stripped out content enclosed in <think> tags.
-    Now, we leave the content unchanged so that the CoT output remains available.
-    """
-    return content
+    """Remove <think>...</think> blocks (multiline supported)."""
+    return re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
 
 def parse_chunk(chunk: bytes) -> str:
     try:
@@ -140,26 +137,34 @@ def parse_chunk(chunk: bytes) -> str:
 def process_stream_response(response: requests.Response, cot_placeholder: Any, ai_placeholder: Any) -> Tuple[str, str, bool]:
     """
     Processes the streaming API response and updates the UI.
-    Accumulates CoT content as it arrives. If the closing tag never arrives,
-    the accumulated CoT (in cot_buffer) is committed once the stream finishes.
+    Accumulates CoT content in a buffer. If the closing </think> tag never arrives,
+    the accumulated CoT is committed when the stream finishes.
+    
+    Additionally, this function accumulates the raw output exactly as received
+    and logs the complete raw output (which includes the CoT and answer as sent by the LLM)
+    once the streaming completes.
     """
     ai_reply, cot_content = "", ""
     capturing_cot = False
     stopped = False
-    cot_buffer = ""  # Buffer for accumulating CoT content
+    cot_buffer = ""
+    raw_output_parts = []  # Accumulate every raw delta exactly as received
+
     for chunk in response.iter_lines():
         if st.session_state.stop_generation:
             stopped = True
             st.session_state.stop_generation = False
             break
         delta = parse_chunk(chunk)
+        raw_output_parts.append(delta)  # Save raw delta
+        
         if not delta:
             continue
+        
         if "<think>" in delta:
             capturing_cot = True
-            # Start collecting CoT content.
-            cot_buffer += delta.replace("<think>", "")
-            delta = ""
+            # Remove the tag for processing, but the raw delta still contains it.
+            delta = delta.replace("<think>", "")
         if capturing_cot:
             if "</think>" in delta:
                 part, remainder = delta.split("</think>", 1)
@@ -169,20 +174,21 @@ def process_stream_response(response: requests.Response, cot_placeholder: Any, a
                 capturing_cot = False
                 with cot_placeholder.expander("🔍 CoT Reasoning (Completed)", expanded=False):
                     st.markdown(cot_content)
-                # Continue with the remainder (if any).
-                delta = remainder
+                delta = remainder  # Process remainder
             else:
                 cot_buffer += delta
                 with cot_placeholder.expander("🔍 CoT Reasoning", expanded=True):
                     st.markdown(f"{cot_buffer} ⏳")
-                continue
+                continue  # Do not append to ai_reply until CoT block is closed
         ai_reply += delta
         ai_placeholder.markdown(ai_reply)
-    # FIX: If the stream ends but we are still capturing CoT, commit the buffer.
+    
     if capturing_cot and cot_buffer:
         cot_content = cot_buffer
         with cot_placeholder.expander("🔍 CoT Reasoning (Completed)", expanded=False):
             st.markdown(cot_content)
+    raw_output = "".join(raw_output_parts)
+    logging.debug("Final raw output: %s", raw_output)
     return ai_reply, cot_content, stopped
 
 def generate_log_text() -> str:
@@ -198,14 +204,26 @@ def generate_log_text() -> str:
     return header + "\n".join(log_lines)
 
 def build_payload() -> Dict[str, Any]:
+    """
+    Builds the payload for the API request.
+    This function takes the current chat history, removes any stale assistant "cot" fields,
+    and always reinserts a fresh system message with "<think>\n" (if prepend_think is enabled)
+    so that the model is forced to generate new CoT data on first generation and on regen.
+    """
     payload_messages: List[Dict[str, Any]] = []
+    
+    # Process the chat history, removing any "cot" field from assistant messages.
     for msg in st.session_state.chat_history:
         msg_copy = msg.copy()
         if msg_copy.get("role") == "assistant" and "cot" in msg_copy:
             del msg_copy["cot"]
         payload_messages.append(msg_copy)
     
+    # Remove any pre-existing system messages so we always insert a fresh one.
+    payload_messages = [msg for msg in payload_messages if msg.get("role") != "system"]
+    
     if st.session_state.prepend_think:
+        # Always insert the default system message to instruct CoT generation.
         payload_messages.insert(0, {"role": "system", "content": "<think>\n"})
     
     total_length = sum(len(json.dumps(msg)) for msg in payload_messages)
@@ -256,7 +274,7 @@ def export_confirmation_flow() -> None:
 # -------------------- Sidebar --------------------
 with st.sidebar:
     st.subheader("🔧 Configuration")
-    # API Endpoint and API Key (no separator here)
+    # API Endpoint and API Key (grouped together without a separator)
     st.session_state.api_endpoint = st.text_input("API Endpoint", st.session_state.api_endpoint)
     st.session_state.use_api_key = st.checkbox("Use API Key", value=st.session_state.use_api_key)
     if st.session_state.use_api_key:
@@ -311,7 +329,7 @@ with st.sidebar:
         st.success("Configuration reset to defaults for this session!")
         st.rerun()
     
-    st.markdown("---")  # Separator for the following groups.
+    st.markdown("---")  # Separator for the remaining groups.
     
     # Group 1: Stop and Clear
     group1 = st.columns(2)
@@ -378,9 +396,6 @@ if st.session_state.pending_generation and not st.session_state.confirm_clear:
             if stopped:
                 if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user":
                     st.session_state.chat_history.pop()
-                if st.session_state.backup_chat_history is not None:
-                    st.session_state.chat_history.extend(st.session_state.backup_chat_history)
-                    st.session_state.backup_chat_history = None
                 st.session_state.pending_prompt = ""
                 st.session_state.pending_generation = False
                 st.rerun()
@@ -395,7 +410,6 @@ if st.session_state.pending_generation and not st.session_state.confirm_clear:
                     })
                     st.session_state.pending_prompt = ""
                     st.session_state.input_counter += 1
-                st.session_state.backup_chat_history = None
                 st.session_state.pending_generation = False
                 st.rerun()
         except requests.exceptions.RequestException as e:
@@ -409,8 +423,8 @@ if (not st.session_state.pending_generation and st.session_state.chat_history an
     with st.container() as action_container:
         spacer, col_regen, col_remove = st.columns([4, 1, 1])
         if col_regen.button("🔄 Regen", key="regen_last", help="Regen"):
+            # For regen, remove the last assistant message (which contains old CoT).
             if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "assistant":
-                st.session_state.backup_chat_history = [st.session_state.chat_history[-1]]
                 st.session_state.chat_history.pop()
             st.session_state.pending_generation = True
             print_payload_history()
