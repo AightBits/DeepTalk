@@ -44,7 +44,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "top_p": 0.95,
     "max_context": 32768,
     "debug": False,
-    "prepend_think": True
+    "prepend_think": True,
+    "use_api_key": False,   # New: whether to use an API key
+    "api_key": ""           # New: the API key value (if any)
 }
 
 def load_config() -> Dict[str, Any]:
@@ -62,6 +64,7 @@ def load_config() -> Dict[str, Any]:
                 config = json.load(f)
         except json.JSONDecodeError:
             config = DEFAULT_CONFIG.copy()
+        # Ensure all keys exist in the configuration.
         for key, value in DEFAULT_CONFIG.items():
             if key not in config:
                 config[key] = value
@@ -89,6 +92,8 @@ default_state: Dict[str, Any] = {
     "confirm_clear": False,
     "debug": config["debug"],
     "prepend_think": config["prepend_think"],
+    "use_api_key": config["use_api_key"],  # New session state value
+    "api_key": config["api_key"],          # New session state value
     "input_counter": 0,
     "save_log_mode": False,
     "backup_chat_history": None,
@@ -214,6 +219,7 @@ def build_payload() -> Dict[str, Any]:
     It copies the chat history but removes the "cot" field from any assistant messages,
     ensuring that only non-CoT (final answer) content is carried forward.
     Also truncates older messages if the total context length exceeds max_context.
+    The payload always specifies the model 'deepseek-reasoner' internally.
     """
     payload_messages: List[Dict[str, Any]] = []
     for msg in st.session_state.chat_history:
@@ -231,6 +237,7 @@ def build_payload() -> Dict[str, Any]:
         total_length = sum(len(json.dumps(msg)) for msg in payload_messages)
     
     return {
+        "model": "deepseek-reasoner",  # Model is now hard-coded internally.
         "messages": payload_messages,
         "temperature": st.session_state.temperature,
         "top_p": st.session_state.top_p,
@@ -278,7 +285,13 @@ def export_confirmation_flow() -> None:
 # -------------------- Sidebar --------------------
 with st.sidebar:
     st.subheader("🔧 Configuration")
+    # --- API Endpoint and API Key (no separator here) ---
     st.session_state.api_endpoint = st.text_input("API Endpoint", st.session_state.api_endpoint)
+    st.session_state.use_api_key = st.checkbox("Use API Key", value=st.session_state.use_api_key)
+    if st.session_state.use_api_key:
+        st.session_state.api_key = st.text_input("API Key", value=st.session_state.api_key, type="password")
+    
+    # --- Other Configuration ---
     st.session_state.temperature = st.slider("Temperature", 0.0, 1.0, st.session_state.temperature, 0.01)
     st.session_state.top_p = st.slider("Top-p", 0.0, 1.0, st.session_state.top_p, 0.01)
     st.session_state.max_context = st.number_input("Max Context", min_value=1024, max_value=32768,
@@ -296,6 +309,8 @@ with st.sidebar:
             "max_context": st.session_state.max_context,
             "debug": st.session_state.debug,
             "prepend_think": st.session_state.prepend_think,
+            "use_api_key": st.session_state.use_api_key,  # Save the state of API key usage.
+            "api_key": st.session_state.api_key           # Save the API key (if provided).
         }
         with open(CONFIG_FILE, "w") as f:
             json.dump(new_config, f, indent=4)
@@ -309,6 +324,8 @@ with st.sidebar:
         st.session_state.max_context = config["max_context"]
         st.session_state.debug = config["debug"]
         st.session_state.prepend_think = config["prepend_think"]
+        st.session_state.use_api_key = config.get("use_api_key", False)
+        st.session_state.api_key = config.get("api_key", "")
         st.success("Configuration reloaded!")
         st.rerun()
     if cols[2].button("Defaults", key="config_defaults"):
@@ -318,10 +335,12 @@ with st.sidebar:
         st.session_state.max_context = DEFAULT_CONFIG["max_context"]
         st.session_state.debug = DEFAULT_CONFIG["debug"]
         st.session_state.prepend_think = DEFAULT_CONFIG["prepend_think"]
+        st.session_state.use_api_key = DEFAULT_CONFIG["use_api_key"]
+        st.session_state.api_key = DEFAULT_CONFIG["api_key"]
         st.success("Configuration reset to defaults for this session!")
         st.rerun()
     
-    st.markdown("---")
+    st.markdown("---")  # Separator for the following groups.
     
     # --- Group 1: Stop and Clear (on one line) ---
     group1 = st.columns(2)
@@ -366,6 +385,9 @@ with st.container() as static_container:
 if st.session_state.pending_generation and not st.session_state.confirm_clear:
     with st.container() as pending_container:
         headers: Dict[str, str] = {"Content-Type": "application/json"}
+        # If using an API key, add it to the headers (e.g. as a Bearer token).
+        if st.session_state.use_api_key and st.session_state.api_key:
+            headers["Authorization"] = f"Bearer {st.session_state.api_key}"
         payload = build_payload()
         if st.session_state.debug:
             logging.debug("Payload being submitted: %s", payload)
