@@ -5,6 +5,14 @@ This GUI enables **Chain-of-Thought (CoT) handling**, ensuring proper contextual
 
 ---
 
+## 📖 Introduction
+
+DeepSeek-R1 is a "reasoning" model that begins with Chain-of-Thought reasoning encapsulated in <think></think> tags, which the model will then use in formulating a response to the user's prompt. The problem is that many LLM clients provide these tagged data along with the response, which means stale CoT output is kept in the context history and submitted back with each prompt of a session. This not only contributes to rapid growth of context, but the CoT data doesn't necessarily relate to future prompts and can negative impact subsequent prompts.
+
+This simple GUI addresses that issue by only keeping CoT content during generation so it can be utilized for the rest of the output, then removes it before appending the answer to the context buffer. All previous CoT content is still available on screen for review and is also provided in debug output and session logs.
+
+---
+
 ## 🚀 Features
 - **Streamlit UI:** Intuitive and easy-to-use interface for interacting with the LLM.
 - **CoT Handling:** Supports `<think></think>` context for improved reasoning.
