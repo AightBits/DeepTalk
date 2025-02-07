@@ -18,6 +18,7 @@ This simple GUI addresses that issue by only keeping CoT content during generati
 - **CoT Handling:** Supports `<think></think>` context for improved reasoning.
 - **Configurable API Settings:** Adjust temperature, top-p, and max context dynamically.
 - **Real-time Streaming:** Displays LLM responses as they are generated.
+- **CoT Output Retention:** Always available for viewing and in session exports
 - **Debugging Tools:** Toggle debug mode to inspect API payloads.
 
 ---
@@ -53,11 +54,13 @@ Specify your OpenAI API-compatible endpoint.
 
 ## ⚙️ Configuration
 The following parameters can be adjusted from the sidebar:
-- **API Endpoint**: Customize the LLM backend URL.
+- **API Endpoint**: Customize the LLM backend URL (and optional API key)
 - **Temperature**: Controls response randomness (0.0 - 1.0).
 - **Top-p**: Limits token selection based on cumulative probability.
 - **Max Context**: Adjusts the context length for conversations.
 - **Debug Mode**: Enables logging of API payloads for inspection.
+- **Prepend <think> tag** Recommended by DeepSeek but switchable for testing
+
 
 ---
 
