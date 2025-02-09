@@ -43,10 +43,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "top_p": 0.95,
     "max_context": 32768,
     "debug": False,
-    # When enabled, if no genuine CoT block is captured, prepend "<think>\n" to the answer.
     "prepend_think": True,
-    "use_api_key": False,  # whether to use an API key
-    "api_key": ""         # the API key value (if any)
+    "use_api_key": False,
+    "api_key": ""
 }
 
 def load_config() -> Dict[str, Any]:
@@ -71,13 +70,12 @@ config: Dict[str, Any] = load_config()
 st.title("🧠 DeepTalk DeepSeek-R1 GUI")
 st.write(
     "Proof-of-Concept for proper handling of CoT (<think></think> tagged) context.\n\n"
-    "CoT context is used for generation but is not passed back on subsequent prompts.\n\n"
-)
+    "CoT context is used for generation but is not passed back on subsequent prompts.")
 
 # -------------------- Session State Initialization --------------------
 default_state: Dict[str, Any] = {
     "api_endpoint": config["api_endpoint"],
-    "chat_history": [],
+    "chat_history": [],  # Only the final answer (without CoT) is stored here.
     "pending_generation": False,
     "pending_prompt": "",
     "temperature": config["temperature"],
@@ -103,6 +101,7 @@ else:
     logging.basicConfig(level=logging.INFO, format="%(message)s\n")
 
 # -------------------- Helper Functions --------------------
+
 def print_payload_history() -> None:
     if st.session_state.debug:
         payload = []
@@ -111,29 +110,27 @@ def print_payload_history() -> None:
         logging.debug("Payload History: %s", payload)
 
 def escape_think_tags(text: str) -> str:
-    """
-    Escapes any occurrences of <think> or </think> in the given text.
-    This converts them to their HTML entity equivalents.
-    """
+    """Escapes <think> and </think> tags."""
     return text.replace("<think>", "&lt;think&gt;").replace("</think>", "&lt;/think&gt;")
 
 def escape_user_tags(text: str) -> str:
-    """
-    For user input, also escape <think> and </think> tags.
-    """
+    """Escapes <think> tags in user input."""
     return text.replace("<think>", "&lt;think&gt;").replace("</think>", "&lt;/think&gt;")
 
-def remove_initial_cot_block(answer: str) -> str:
+def extract_cot(full_output: str) -> Tuple[str, str]:
     """
-    If the answer starts with a genuine chain-of-thought block (i.e. an unescaped
-    <think> ... </think> block), remove that block and return the remainder.
-    Assumes the block was already extracted.
+    Uses a regex to extract the first well-formed CoT block from full_output.
+    Returns (final_answer, cot_block) where final_answer is the text after </think>.
+    If no block is found, returns (full_output, "").
     """
-    start_index = answer.find("<think>")
-    end_index = answer.find("</think>", start_index + len("<think>")) if start_index != -1 else -1
-    if start_index != -1 and end_index != -1:
-        return answer[end_index + len("</think>"):].lstrip()
-    return answer
+    pattern = r"^\s*<think>(.*?)</think>\s*(.*)"
+    m = re.match(pattern, full_output, flags=re.DOTALL)
+    if m:
+        cot_block = m.group(1).strip()
+        final_answer = m.group(2)
+        return final_answer, cot_block
+    else:
+        return full_output, ""
 
 def parse_chunk(chunk: bytes) -> str:
     try:
@@ -156,93 +153,114 @@ def parse_chunk(chunk: bytes) -> str:
             logging.debug("Error parsing JSON: %s", e)
         return ""
 
-def process_stream_response(response: requests.Response, cot_placeholder: Any, ai_placeholder: Any) -> Tuple[str, str, bool]:
+def process_stream_response(response: requests.Response, cot_placeholder: Any, display_placeholder: Any) -> Tuple[str, str, str, bool]:
     """
-    Processes the streaming API response and extracts the initial chain-of-thought (CoT) block,
-    if present. The model’s output is expected to start with an unescaped <think> tag that begins
-    the CoT block. Once that block begins, any subsequent occurrences of <think> or </think> are
-    treated as literal text (escaped) until the first matching </think> is found.
-    After the CoT block ends, all further <think> or </think> tags in the main answer are escaped.
-    If an errant closing tag is encountered without a matching open tag, returns an error message.
+    Processes the streaming API response and maintains three buffers:
+      - live_internal: the complete raw output as received (for the model's active context)
+      - final_output: collects text only after the genuine CoT block (for display and storage)
+      - cot_buffer: collects the CoT block (for the dedicated CoT window)
+    
+    During streaming:
+      - The internal context (live_internal) is updated continuously (and is hidden from the user).
+      - The dedicated CoT window (via cot_placeholder) is updated live with cot_buffer.
+      - The visible answer window (via display_placeholder) is updated only with final_output,
+        so that the displayed answer never includes the CoT block.
+    
+    Returns a tuple: (live_internal, final_output, cot_buffer, stopped flag)
     """
-    ai_reply, cot_content = "", ""
+    live_internal = ""
+    final_output = ""
+    cot_buffer = ""
     capturing_cot = False
     stopped = False
-    cot_buffer = ""
-    raw_output_parts = []
-    
+
     for chunk in response.iter_lines():
         if st.session_state.stop_generation:
             stopped = True
             st.session_state.stop_generation = False
             break
+
         delta = parse_chunk(chunk)
-        raw_output_parts.append(delta)
+        live_internal += delta  # Always accumulate full internal output.
+        # Update the internal placeholder (hidden); the model uses live_internal internally.
+        # (We do not update display_placeholder here because we want it to show only final_output.)
+        
         if not delta:
             continue
 
-        # If not capturing and an unescaped closing tag is found, that's an error.
-        if not capturing_cot and "</think>" in delta:
-            return "Error: Errant closing </think> tag encountered.", "", True
-
+        # If not yet capturing and an unescaped <think> tag is encountered at the beginning, start capturing.
         if not capturing_cot and delta.lstrip().startswith("<think>"):
-            # Begin capturing the CoT block.
             capturing_cot = True
-            delta = delta.replace("<think>", "", 1)
+            text_after = delta.lstrip()[len("<think>"):]
+            cot_buffer += text_after
+            with cot_placeholder.expander("🔍 CoT Reasoning (Live)", expanded=True):
+                st.markdown(cot_buffer)
+            continue  # Do not add this delta to final_output.
         if capturing_cot:
-            # While capturing, if we find a closing tag, that ends the block.
             if "</think>" in delta:
                 part, remainder = delta.split("</think>", 1)
-                # Escape any additional <think> or </think> within the captured text.
-                cot_buffer += escape_think_tags(part)
-                cot_content = cot_buffer
-                cot_buffer = ""
+                cot_buffer += part
                 capturing_cot = False
                 with cot_placeholder.expander("🔍 CoT Reasoning (Completed)", expanded=False):
-                    st.markdown(cot_content)
-                delta = remainder  # Process remainder as part of the main answer.
+                    st.markdown(cot_buffer)
+                final_output += remainder  # Start collecting final_output after closing tag.
             else:
-                # No closing tag yet: escape any subsequent <think> or </think> as literal text.
-                cot_buffer += escape_think_tags(delta)
-                with cot_placeholder.expander("🔍 CoT Reasoning", expanded=True):
-                    st.markdown(f"{cot_buffer} ⏳")
-                continue  # Wait for the closing tag.
+                cot_buffer += delta
+                with cot_placeholder.expander("🔍 CoT Reasoning (Live)", expanded=True):
+                    st.markdown(cot_buffer)
+            continue  # While capturing, do not add to final_output.
         else:
-            # Not in CoT capture: escape any <think> tags that might appear.
-            delta = escape_think_tags(delta)
-        
-        ai_reply += delta
-        ai_placeholder.markdown(ai_reply)
-    
-    if capturing_cot:
-        # If still capturing at end-of-stream, that's an error.
-        return "Error: CoT block never closed.", "", True
+            final_output += delta
 
-    logging.debug("Final raw output: %s", "".join(raw_output_parts))
-    return ai_reply, cot_content, stopped
+        # Update the visible display (the answer window) with final_output only.
+        display_placeholder.markdown(final_output)
+
+    if capturing_cot:
+        return "Error: CoT block never closed.", "", "", True
+    return live_internal, final_output, cot_buffer, stopped
 
 def generate_log_text() -> str:
-    header = "Log Exported on " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n\n"
+    separator = "\n\n----------------------------------------\n\n"
+    group_separator = "\n\n========================================\n\n"
+    header = "Log Exported on " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + f"{group_separator}"
     log_lines: List[str] = []
     for i in range(0, len(st.session_state.chat_history) - 1, 2):
-        if st.session_state.chat_history[i]["role"] == "user" and st.session_state.chat_history[i+1]["role"] == "assistant":
+        if (st.session_state.chat_history[i]["role"] == "user" and 
+            st.session_state.chat_history[i+1]["role"] == "assistant"):
             user_text = st.session_state.chat_history[i].get("content", "").strip()
             cot_text = st.session_state.chat_history[i+1].get("cot", "").strip() or "None"
-            answer_text = st.session_state.chat_history[i+1].get("content", "").strip() or "None"
-            log_lines.append(f"User:\n{user_text}\n\nCoT:\n{cot_text}\n\nAnswer:\n{answer_text}\n\n")
+            display_text = st.session_state.chat_history[i+1].get("content", "").strip() or "None"
+            log_lines.append(
+                f"User:\n{user_text}"
+                f"{separator}"
+                f"CoT Reasoning:\n{cot_text}"
+                f"{separator}"
+                f"Answer:\n{display_text}"
+                f"{group_separator}"
+            )
     return header + "\n".join(log_lines)
 
 def build_payload() -> Dict[str, Any]:
     """
     Builds the payload for the API request.
-    The user's prompt is sent exactly as provided—but with any <think> tags escaped.
+    For user messages, uses the provided content.
+    For assistant messages, we now send only the display version (without the CoT) so that past prompts never include CoT data.
+    This ensures that while the model saw its full output during active generation,
+    subsequent prompts only include the final answer (display version).
     """
     payload_messages: List[Dict[str, Any]] = []
     for msg in st.session_state.chat_history:
-        payload_messages.append({
-            "role": msg.get("role"),
-            "content": msg.get("content", "")
-        })
+        # For assistant messages, only use the "content" field (the display version).
+        if msg.get("role") == "assistant":
+            payload_messages.append({
+                "role": msg.get("role"),
+                "content": msg.get("content", "")
+            })
+        else:
+            payload_messages.append({
+                "role": msg.get("role"),
+                "content": msg.get("content", "")
+            })
     total_length = sum(len(json.dumps(msg)) for msg in payload_messages)
     while total_length > st.session_state.max_context and len(payload_messages) > 1:
         payload_messages.pop(0)
@@ -357,7 +375,7 @@ with st.sidebar:
 pending_key = f"pending_prompt_{st.session_state.input_counter}"
 user_input = st.chat_input("Type your message here...", key=pending_key)
 if user_input:
-    # Escape any <think> tags in the user input so they're treated as literal text.
+    # Escape any <think> tags in user input so they're treated as literal text.
     escaped_input = escape_user_tags(user_input)
     st.session_state.chat_history.append({
         "role": "user",
@@ -388,8 +406,10 @@ if st.session_state.pending_generation and not st.session_state.confirm_clear:
         if st.session_state.use_api_key and st.session_state.api_key:
             headers["Authorization"] = f"Bearer {st.session_state.api_key}"
         payload = build_payload()
+        # Log the submitted payload (raw, unformatted) with a timestamp.
         if st.session_state.debug:
-            logging.debug("Payload being submitted: %s", payload)
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            logging.debug(f"{ts}: {json.dumps(payload)}")
         if not st.session_state.api_endpoint.startswith(("http://", "https://")):
             st.error("Invalid API endpoint URL. Please include 'http://' or 'https://'.")
             st.session_state.pending_generation = False
@@ -398,38 +418,36 @@ if st.session_state.pending_generation and not st.session_state.confirm_clear:
             response = requests.post(st.session_state.api_endpoint, json=payload, headers=headers, stream=True)
             response.raise_for_status()
             assistant_placeholder = st.empty()
+            # Create two separate placeholders: one for internal context (hidden) and one for display.
+            internal_placeholder = st.empty()  # hidden (for internal context; not shown)
+            display_placeholder = st.empty()   # visible answer window
             with assistant_placeholder:
                 with st.chat_message("assistant"):
                     with st.container() as stream_container:
                         cot_placeholder = st.empty()
-                        ai_placeholder = st.empty()
-                        ai_reply, cot_content, stopped = process_stream_response(response, cot_placeholder, ai_placeholder)
+                        # Process the stream:
+                        live_internal, final_output, cot_content, stopped = process_stream_response(response, cot_placeholder, display_placeholder)
             if stopped:
                 if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user":
                     st.session_state.chat_history.pop()
                 st.session_state.pending_prompt = ""
                 st.session_state.pending_generation = False
                 st.rerun()
-            else:
-                # If a CoT block was captured, remove it from the final answer.
-                if cot_content:
-                    final_answer = remove_initial_cot_block(ai_reply)
-                else:
-                    final_answer = ai_reply
-                # If no CoT block was captured and the option is enabled, enforce that the answer starts with "<think>\n".
-                if st.session_state.prepend_think and not cot_content:
-                    if not final_answer.startswith("<think>\n"):
-                        final_answer = "<think>\n" + final_answer
-                if final_answer:
-                    st.session_state.chat_history.append({
-                        "role": "assistant",
-                        "content": final_answer,
-                        "cot": cot_content or ""
-                    })
-                    st.session_state.pending_prompt = ""
-                    st.session_state.input_counter += 1
-                st.session_state.pending_generation = False
-                st.rerun()
+            # Log the complete raw internal output (for debugging) with a timestamp.
+            if st.session_state.debug:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                logging.debug(f"\n{ts}: {live_internal}")
+            # Post-generation, store only the final answer (which is final_output) in chat history.
+            # This ensures that subsequent prompts do not include the CoT block.
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": final_output,  # final answer for display (without CoT)
+                "cot": cot_content       # separate CoT block available for export
+            })
+            st.session_state.pending_prompt = ""
+            st.session_state.input_counter += 1
+            st.session_state.pending_generation = False
+            st.rerun()
         except requests.exceptions.RequestException as e:
             st.error(f"API Error: {e}")
             st.session_state.pending_generation = False
