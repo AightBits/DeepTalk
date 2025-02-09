@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DeepTalk DeepSeek R1 GUI
+DeepTalk DeepSeek-R1 GUI
 -------------------------
-A Streamlit-based PoC for inferencing DeepSeek-R1 models
-via OpenAI API with CoT context handling.
+A Streamlit-based PoC for inferencing DeepSeek-R1 models via OpenAI API with CoT context handling.
 
 Copyright (c) 2025 Dave Ziegler
 
@@ -39,14 +38,15 @@ st.set_page_config(page_title="DeepTalk DeepSeek-R1 GUI", page_icon="🤖", layo
 # -------------------- Configuration File Handling --------------------
 CONFIG_FILE: str = 'config.json'
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "api_endpoint": "http://linux-ai.local:5000/v1/chat/completions",
+    "api_endpoint": "http://localhost:5000/v1/chat/completions",
     "temperature": 0.6,
     "top_p": 0.95,
     "max_context": 32768,
     "debug": False,
+    # When enabled, if no genuine CoT block is captured, prepend "<think>\n" to the answer.
     "prepend_think": True,
-    "use_api_key": False,   # whether to use an API key
-    "api_key": ""           # the API key value (if any)
+    "use_api_key": False,  # whether to use an API key
+    "api_key": ""         # the API key value (if any)
 }
 
 def load_config() -> Dict[str, Any]:
@@ -71,7 +71,7 @@ config: Dict[str, Any] = load_config()
 st.title("🧠 DeepTalk DeepSeek-R1 GUI")
 st.write(
     "Proof-of-Concept for proper handling of CoT (<think></think> tagged) context.\n\n"
-    "CoT context is used for generation but is not passed back on subsequent prompts."
+    "CoT context is used for generation but is not passed back on subsequent prompts.\n\n"
 )
 
 # -------------------- Session State Initialization --------------------
@@ -105,13 +105,35 @@ else:
 # -------------------- Helper Functions --------------------
 def print_payload_history() -> None:
     if st.session_state.debug:
-        payload = [{"role": msg["role"], "content": msg["content"]} for msg in st.session_state.chat_history]
+        payload = []
+        for msg in st.session_state.chat_history:
+            payload.append({"role": msg.get("role"), "content": msg.get("content", "")})
         logging.debug("Payload History: %s", payload)
 
-# Revert clean_content to the working version that removes <think>...</think> blocks.
-def clean_content(content: str) -> str:
-    """Remove <think>...</think> blocks (multiline supported)."""
-    return re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+def escape_think_tags(text: str) -> str:
+    """
+    Escapes any occurrences of <think> or </think> in the given text.
+    This converts them to their HTML entity equivalents.
+    """
+    return text.replace("<think>", "&lt;think&gt;").replace("</think>", "&lt;/think&gt;")
+
+def escape_user_tags(text: str) -> str:
+    """
+    For user input, also escape <think> and </think> tags.
+    """
+    return text.replace("<think>", "&lt;think&gt;").replace("</think>", "&lt;/think&gt;")
+
+def remove_initial_cot_block(answer: str) -> str:
+    """
+    If the answer starts with a genuine chain-of-thought block (i.e. an unescaped
+    <think> ... </think> block), remove that block and return the remainder.
+    Assumes the block was already extracted.
+    """
+    start_index = answer.find("<think>")
+    end_index = answer.find("</think>", start_index + len("<think>")) if start_index != -1 else -1
+    if start_index != -1 and end_index != -1:
+        return answer[end_index + len("</think>"):].lstrip()
+    return answer
 
 def parse_chunk(chunk: bytes) -> str:
     try:
@@ -136,103 +158,97 @@ def parse_chunk(chunk: bytes) -> str:
 
 def process_stream_response(response: requests.Response, cot_placeholder: Any, ai_placeholder: Any) -> Tuple[str, str, bool]:
     """
-    Processes the streaming API response and updates the UI.
-    Accumulates CoT content in a buffer. If the closing </think> tag never arrives,
-    the accumulated CoT is committed when the stream finishes.
-    
-    Additionally, this function accumulates the raw output exactly as received
-    and logs the complete raw output (which includes the CoT and answer as sent by the LLM)
-    once the streaming completes.
+    Processes the streaming API response and extracts the initial chain-of-thought (CoT) block,
+    if present. The model’s output is expected to start with an unescaped <think> tag that begins
+    the CoT block. Once that block begins, any subsequent occurrences of <think> or </think> are
+    treated as literal text (escaped) until the first matching </think> is found.
+    After the CoT block ends, all further <think> or </think> tags in the main answer are escaped.
+    If an errant closing tag is encountered without a matching open tag, returns an error message.
     """
     ai_reply, cot_content = "", ""
     capturing_cot = False
     stopped = False
     cot_buffer = ""
-    raw_output_parts = []  # Accumulate every raw delta exactly as received
-
+    raw_output_parts = []
+    
     for chunk in response.iter_lines():
         if st.session_state.stop_generation:
             stopped = True
             st.session_state.stop_generation = False
             break
         delta = parse_chunk(chunk)
-        raw_output_parts.append(delta)  # Save raw delta
-        
+        raw_output_parts.append(delta)
         if not delta:
             continue
-        
-        if "<think>" in delta:
+
+        # If not capturing and an unescaped closing tag is found, that's an error.
+        if not capturing_cot and "</think>" in delta:
+            return "Error: Errant closing </think> tag encountered.", "", True
+
+        if not capturing_cot and delta.lstrip().startswith("<think>"):
+            # Begin capturing the CoT block.
             capturing_cot = True
-            # Remove the tag for processing, but the raw delta still contains it.
-            delta = delta.replace("<think>", "")
+            delta = delta.replace("<think>", "", 1)
         if capturing_cot:
+            # While capturing, if we find a closing tag, that ends the block.
             if "</think>" in delta:
                 part, remainder = delta.split("</think>", 1)
-                cot_buffer += part
+                # Escape any additional <think> or </think> within the captured text.
+                cot_buffer += escape_think_tags(part)
                 cot_content = cot_buffer
                 cot_buffer = ""
                 capturing_cot = False
                 with cot_placeholder.expander("🔍 CoT Reasoning (Completed)", expanded=False):
                     st.markdown(cot_content)
-                delta = remainder  # Process remainder
+                delta = remainder  # Process remainder as part of the main answer.
             else:
-                cot_buffer += delta
+                # No closing tag yet: escape any subsequent <think> or </think> as literal text.
+                cot_buffer += escape_think_tags(delta)
                 with cot_placeholder.expander("🔍 CoT Reasoning", expanded=True):
                     st.markdown(f"{cot_buffer} ⏳")
-                continue  # Do not append to ai_reply until CoT block is closed
+                continue  # Wait for the closing tag.
+        else:
+            # Not in CoT capture: escape any <think> tags that might appear.
+            delta = escape_think_tags(delta)
+        
         ai_reply += delta
         ai_placeholder.markdown(ai_reply)
     
-    if capturing_cot and cot_buffer:
-        cot_content = cot_buffer
-        with cot_placeholder.expander("🔍 CoT Reasoning (Completed)", expanded=False):
-            st.markdown(cot_content)
-    raw_output = "".join(raw_output_parts)
-    logging.debug("Final raw output: %s", raw_output)
+    if capturing_cot:
+        # If still capturing at end-of-stream, that's an error.
+        return "Error: CoT block never closed.", "", True
+
+    logging.debug("Final raw output: %s", "".join(raw_output_parts))
     return ai_reply, cot_content, stopped
 
 def generate_log_text() -> str:
     header = "Log Exported on " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n\n"
     log_lines: List[str] = []
-    history = st.session_state.chat_history
-    for i in range(0, len(history) - 1, 2):
-        if history[i]["role"] == "user" and history[i+1]["role"] == "assistant":
-            user_text = history[i]["content"].strip()
-            cot_text = history[i+1].get("cot", "").strip() or "None"
-            answer_text = history[i+1].get("content", "").strip() or "None"
+    for i in range(0, len(st.session_state.chat_history) - 1, 2):
+        if st.session_state.chat_history[i]["role"] == "user" and st.session_state.chat_history[i+1]["role"] == "assistant":
+            user_text = st.session_state.chat_history[i].get("content", "").strip()
+            cot_text = st.session_state.chat_history[i+1].get("cot", "").strip() or "None"
+            answer_text = st.session_state.chat_history[i+1].get("content", "").strip() or "None"
             log_lines.append(f"User:\n{user_text}\n\nCoT:\n{cot_text}\n\nAnswer:\n{answer_text}\n\n")
     return header + "\n".join(log_lines)
 
 def build_payload() -> Dict[str, Any]:
     """
     Builds the payload for the API request.
-    This function takes the current chat history, removes any stale assistant "cot" fields,
-    and always reinserts a fresh system message with "<think>\n" (if prepend_think is enabled)
-    so that the model is forced to generate new CoT data on first generation and on regen.
+    The user's prompt is sent exactly as provided—but with any <think> tags escaped.
     """
     payload_messages: List[Dict[str, Any]] = []
-    
-    # Process the chat history, removing any "cot" field from assistant messages.
     for msg in st.session_state.chat_history:
-        msg_copy = msg.copy()
-        if msg_copy.get("role") == "assistant" and "cot" in msg_copy:
-            del msg_copy["cot"]
-        payload_messages.append(msg_copy)
-    
-    # Remove any pre-existing system messages so we always insert a fresh one.
-    payload_messages = [msg for msg in payload_messages if msg.get("role") != "system"]
-    
-    if st.session_state.prepend_think:
-        # Always insert the default system message to instruct CoT generation.
-        payload_messages.insert(0, {"role": "system", "content": "<think>\n"})
-    
+        payload_messages.append({
+            "role": msg.get("role"),
+            "content": msg.get("content", "")
+        })
     total_length = sum(len(json.dumps(msg)) for msg in payload_messages)
     while total_length > st.session_state.max_context and len(payload_messages) > 1:
         payload_messages.pop(0)
         total_length = sum(len(json.dumps(msg)) for msg in payload_messages)
-    
     return {
-        "model": "deepseek-reasoner",  # Hard-coded internal model.
+        "model": "deepseek-reasoner",
         "messages": payload_messages,
         "temperature": st.session_state.temperature,
         "top_p": st.session_state.top_p,
@@ -274,21 +290,16 @@ def export_confirmation_flow() -> None:
 # -------------------- Sidebar --------------------
 with st.sidebar:
     st.subheader("🔧 Configuration")
-    # API Endpoint and API Key (grouped together without a separator)
     st.session_state.api_endpoint = st.text_input("API Endpoint", st.session_state.api_endpoint)
     st.session_state.use_api_key = st.checkbox("Use API Key", value=st.session_state.use_api_key)
     if st.session_state.use_api_key:
         st.session_state.api_key = st.text_input("API Key", value=st.session_state.api_key, type="password")
-    
-    # Other Configuration
     st.session_state.temperature = st.slider("Temperature", 0.0, 1.0, st.session_state.temperature, 0.01)
     st.session_state.top_p = st.slider("Top-p", 0.0, 1.0, st.session_state.top_p, 0.01)
     st.session_state.max_context = st.number_input("Max Context", min_value=1024, max_value=32768,
                                                     value=st.session_state.max_context, step=1024)
     st.session_state.debug = st.checkbox("Debug", value=st.session_state.debug)
     st.session_state.prepend_think = st.checkbox("Prepend <think> tag", value=st.session_state.prepend_think)
-    
-    # Configuration Buttons
     cols = st.columns(3)
     if cols[0].button("Save", key="config_save"):
         new_config = {
@@ -328,10 +339,7 @@ with st.sidebar:
         st.session_state.api_key = DEFAULT_CONFIG["api_key"]
         st.success("Configuration reset to defaults for this session!")
         st.rerun()
-    
-    st.markdown("---")  # Separator for the remaining groups.
-    
-    # Group 1: Stop and Clear
+    st.markdown("---")
     group1 = st.columns(2)
     if group1[0].button("🛑 Stop", key="stop_button"):
         st.session_state.stop_generation = True
@@ -340,8 +348,6 @@ with st.sidebar:
         st.rerun()
     if st.session_state.confirm_clear:
         clear_confirmation_flow()
-    
-    # Group 2: Export
     if st.button("📄 Export", key="export_button", disabled=st.session_state.pending_generation):
         st.session_state.save_log_mode = True
     if st.session_state.save_log_mode:
@@ -351,8 +357,13 @@ with st.sidebar:
 pending_key = f"pending_prompt_{st.session_state.input_counter}"
 user_input = st.chat_input("Type your message here...", key=pending_key)
 if user_input:
-    st.session_state.chat_history.append({"role": "user", "content": user_input})
-    st.session_state.pending_prompt = user_input
+    # Escape any <think> tags in the user input so they're treated as literal text.
+    escaped_input = escape_user_tags(user_input)
+    st.session_state.chat_history.append({
+        "role": "user",
+        "content": escaped_input
+    })
+    st.session_state.pending_prompt = escaped_input
     st.session_state.pending_generation = True
     st.rerun()
 
@@ -362,13 +373,13 @@ with st.container() as static_container:
     for msg in st.session_state.chat_history:
         if msg["role"] == "user":
             with st.chat_message("user"):
-                st.write(msg["content"])
+                st.write(msg.get("content", ""))
         elif msg["role"] == "assistant":
             with st.chat_message("assistant"):
                 if msg.get("cot"):
                     with st.expander("🔍 CoT Reasoning (Completed)", expanded=False):
                         st.markdown(msg["cot"])
-                st.write(msg["content"])
+                st.write(msg.get("content", ""))
 
 # -------------------- Process Pending Generation --------------------
 if st.session_state.pending_generation and not st.session_state.confirm_clear:
@@ -400,13 +411,20 @@ if st.session_state.pending_generation and not st.session_state.confirm_clear:
                 st.session_state.pending_generation = False
                 st.rerun()
             else:
-                cleaned_ai_reply = clean_content(ai_reply).strip()
-                cleaned_cot_content = cot_content.strip() if cot_content else ""
-                if cleaned_ai_reply:
+                # If a CoT block was captured, remove it from the final answer.
+                if cot_content:
+                    final_answer = remove_initial_cot_block(ai_reply)
+                else:
+                    final_answer = ai_reply
+                # If no CoT block was captured and the option is enabled, enforce that the answer starts with "<think>\n".
+                if st.session_state.prepend_think and not cot_content:
+                    if not final_answer.startswith("<think>\n"):
+                        final_answer = "<think>\n" + final_answer
+                if final_answer:
                     st.session_state.chat_history.append({
                         "role": "assistant",
-                        "content": cleaned_ai_reply,
-                        "cot": cleaned_cot_content
+                        "content": final_answer,
+                        "cot": cot_content or ""
                     })
                     st.session_state.pending_prompt = ""
                     st.session_state.input_counter += 1
@@ -423,7 +441,6 @@ if (not st.session_state.pending_generation and st.session_state.chat_history an
     with st.container() as action_container:
         spacer, col_regen, col_remove = st.columns([4, 1, 1])
         if col_regen.button("🔄 Regen", key="regen_last", help="Regen"):
-            # For regen, remove the last assistant message (which contains old CoT).
             if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "assistant":
                 st.session_state.chat_history.pop()
             st.session_state.pending_generation = True
