@@ -11,12 +11,14 @@ DeepSeek-R1 is a "reasoning" model that begins with **Chain-of-Thought (CoT) rea
 
 ### **The Problem: Uncontrolled CoT Context Growth**
 Most LLM clients currently **retain and resend CoT outputs** in session history, leading to:
+
 1. **Context Window Bloat** – Unnecessary CoT data rapidly consumes available tokens.
 2. **Irrelevant CoT Carryover** – Old reasoning outputs persist and interfere with new queries.
 3. **Redundant Processing** – The model repeatedly processes stale CoT, degrading response quality.
 
 ### **The Solution: Controlled CoT Retention**
 This GUI **isolates CoT reasoning during generation**, ensuring:
+
 ✔ CoT reasoning is **used for inference but not stored** in session memory.  
 ✔ CoT explanations remain **visible for review** but are excluded from future prompts.  
 ✔ The conversation buffer is **optimized** for better model efficiency and coherence.
