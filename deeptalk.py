@@ -36,9 +36,9 @@ from typing import Any, Dict, List, Tuple
 st.set_page_config(page_title="DeepTalk DeepSeek-R1 GUI", page_icon="🤖", layout="wide")
 
 # -------------------- Configuration File Handling --------------------
-CONFIG_FILE: str = 'config.json'
 DEFAULT_CONFIG: Dict[str, Any] = {
     "api_endpoint": "http://localhost:5000/v1/chat/completions",
+    "api_model": "deepseek-reasoner",  # Added API Model to config
     "temperature": 0.6,
     "top_p": 0.95,
     "max_context": 32768,
@@ -47,6 +47,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "use_api_key": False,
     "api_key": ""
 }
+CONFIG_FILE: str = 'config.json'
 
 def load_config() -> Dict[str, Any]:
     if not os.path.exists(CONFIG_FILE):
@@ -74,6 +75,7 @@ st.write(
 # -------------------- Session State Initialization --------------------
 default_state: Dict[str, Any] = {
     "api_endpoint": config["api_endpoint"],
+    "api_model": config["api_model"],  # Initialize API Model
     "chat_history": [],  # Only the final answer (without CoT) is stored here.
     "pending_generation": False,
     "pending_prompt": "",
@@ -244,7 +246,7 @@ def build_payload() -> Dict[str, Any]:
         payload_messages.pop(0)
         total_length = sum(len(json.dumps(msg)) for msg in payload_messages)
     return {
-        "model": "deepseek-reasoner",
+        "model": st.session_state.api_model,  # Use the dynamic API model
         "messages": payload_messages,
         "temperature": st.session_state.temperature,
         "top_p": st.session_state.top_p,
@@ -341,6 +343,8 @@ def render_sidebar():
     with st.sidebar:
         st.subheader("🔧 Configuration")
         st.session_state.api_endpoint = st.text_input("API Endpoint", st.session_state.api_endpoint)
+        # Added API Model textbox under API Endpoint and above API Key
+        st.session_state.api_model = st.text_input("API Model", st.session_state.api_model)
         st.session_state.use_api_key = st.checkbox("Use API Key", value=st.session_state.use_api_key)
         if st.session_state.use_api_key:
             st.session_state.api_key = st.text_input("API Key", value=st.session_state.api_key, type="password")
@@ -349,13 +353,14 @@ def render_sidebar():
         st.session_state.max_context = st.number_input("Max Context", min_value=1024, max_value=32768,
                                                         value=st.session_state.max_context, step=1024)
         st.session_state.debug = st.checkbox("Debug", value=st.session_state.debug)
-        # **Update the logging level dynamically based on the current debug setting:**
+        # Update logging level dynamically based on debug setting
         logging.getLogger().setLevel(logging.DEBUG if st.session_state.debug else logging.INFO)
         st.session_state.prepend_think = st.checkbox("Prepend <think> tag", value=st.session_state.prepend_think)
         cols = st.columns(3)
         if cols[0].button("Save", key="config_save"):
             new_config = {
                 "api_endpoint": st.session_state.api_endpoint,
+                "api_model": st.session_state.api_model,  # Save API Model in config
                 "temperature": st.session_state.temperature,
                 "top_p": st.session_state.top_p,
                 "max_context": st.session_state.max_context,
@@ -371,6 +376,7 @@ def render_sidebar():
         if cols[1].button("Reload", key="config_reload"):
             new_config = load_config()
             st.session_state.api_endpoint = new_config["api_endpoint"]
+            st.session_state.api_model = new_config["api_model"]  # Reload API Model from config
             st.session_state.temperature = new_config["temperature"]
             st.session_state.top_p = new_config["top_p"]
             st.session_state.max_context = new_config["max_context"]
@@ -382,6 +388,7 @@ def render_sidebar():
             st.rerun()
         if cols[2].button("Defaults", key="config_defaults"):
             st.session_state.api_endpoint = DEFAULT_CONFIG["api_endpoint"]
+            st.session_state.api_model = DEFAULT_CONFIG["api_model"]  # Reset API Model to default
             st.session_state.temperature = DEFAULT_CONFIG["temperature"]
             st.session_state.top_p = DEFAULT_CONFIG["top_p"]
             st.session_state.max_context = DEFAULT_CONFIG["max_context"]
