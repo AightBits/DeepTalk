@@ -1,6 +1,6 @@
 # 🧠 DeepTalk DeepSeek-R1 GUI
 
-A Streamlit-based Proof-of-Concept (PoC) for inferencing **DeepSeek-R1** and **Qwen-QwQ*** models via the OpenAI API.  
+A Streamlit-based Proof-of-Concept (PoC) for inferencing **DeepSeek-R1** and **Qwen-QwQ** models via the OpenAI API.  
 This GUI enables **Chain-of-Thought (CoT) handling**, ensuring proper contextual reasoning for LLM interactions while preventing stale CoT data from polluting session memory.
 
 ---
