@@ -1,13 +1,13 @@
 # 🧠 DeepTalk DeepSeek-R1 GUI
 
-A Streamlit-based Proof-of-Concept (PoC) for inferencing **DeepSeek-R1** models via the OpenAI API.  
+A Streamlit-based Proof-of-Concept (PoC) for inferencing **DeepSeek-R1** and **Qwen-QwQ*** models via the OpenAI API.  
 This GUI enables **Chain-of-Thought (CoT) handling**, ensuring proper contextual reasoning for LLM interactions while preventing stale CoT data from polluting session memory.
 
 ---
 
 ## 📖 Introduction
 
-DeepSeek-R1 is a "reasoning" model that begins with **Chain-of-Thought (CoT) reasoning**, encapsulated within `<think></think>` tags. This mechanism allows the model to break down complex problems and generate structured responses.
+DeepSeek-R1 and Qwen-QwQ are "reasoning" models that begins with **Chain-of-Thought (CoT) reasoning**, encapsulated within `<think></think>` tags. This mechanism allows the model to break down complex problems and generate structured responses.
 
 ### **The Problem: Uncontrolled CoT Context Growth**
 Most LLM clients currently **retain and resend CoT outputs** in session history, leading to:
@@ -27,7 +27,7 @@ This GUI **isolates CoT reasoning during generation**, ensuring:
 
 ## 🚀 Features
 
-- **📡 Streamlit UI** – Intuitive interface for interacting with DeepSeek-R1.
+- **📡 Streamlit UI** – Intuitive interface for interacting with DeepSeek-R1 and Qwen-QwQ.
 - **🧠 CoT Segmentation** – Extracts `<think></think>` reasoning while **preventing stale CoT retention**.
 - **📡 Real-time Streaming** – Displays LLM responses **as they are generated**.
 - **📌 Live CoT View** – CoT reasoning is displayed **separately in real-time** but excluded from history.
@@ -75,7 +75,7 @@ Specify your OpenAI-compatible API endpoint in the UI.
 ## 🔍 How CoT Handling Works
 
 1. **User submits a prompt.**  
-2. **DeepSeek-R1 generates a response with CoT reasoning.**  
+2. **Model generates a response with CoT reasoning.**  
 3. **The GUI captures and streams CoT reasoning separately.**  
 4. **Once completed, CoT is removed from context memory.**  
 5. **Only the final response is stored in chat history.**  
